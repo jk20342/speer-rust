@@ -272,7 +272,7 @@ pub enum EventType {
     StreamData,
     StreamClosed,
     Error,
-    Unknown(i32),
+    Unknown(u32),
 }
 
 impl From<sys::speer_event_type_t> for EventType {
@@ -287,7 +287,7 @@ impl From<sys::speer_event_type_t> for EventType {
             x if x == sys::speer_event_type_t_SPEER_EVENT_STREAM_DATA => Self::StreamData,
             x if x == sys::speer_event_type_t_SPEER_EVENT_STREAM_CLOSED => Self::StreamClosed,
             x if x == sys::speer_event_type_t_SPEER_EVENT_ERROR => Self::Error,
-            other => Self::Unknown(other),
+            other => Self::Unknown(other as u32),
         }
     }
 }
@@ -299,7 +299,7 @@ pub enum DisconnectReason {
     HandshakeFailed,
     ProtocolError,
     Application,
-    Unknown(i32),
+    Unknown(u32),
 }
 
 impl From<sys::speer_disconnect_reason_t> for DisconnectReason {
@@ -316,7 +316,7 @@ impl From<sys::speer_disconnect_reason_t> for DisconnectReason {
             x if x == sys::speer_disconnect_reason_t_SPEER_DISCONNECT_APPLICATION => {
                 Self::Application
             }
-            other => Self::Unknown(other),
+            other => Self::Unknown(other as u32),
         }
     }
 }
