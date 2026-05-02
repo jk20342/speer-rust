@@ -185,7 +185,7 @@ impl Host {
         self.raw.as_ptr()
     }
 
-    pub fn poll(&self, timeout_ms: i32) -> i32 {
+    pub fn poll(&mut self, timeout_ms: i32) -> i32 {
         unsafe { sys::speer_host_poll(self.raw.as_ptr(), timeout_ms) }
     }
 
