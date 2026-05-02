@@ -21,7 +21,7 @@ cargo check
 speer = "0.1"
 ```
 
-or from this workspace:
+or from a local checkout:
 
 ```toml
 [dependencies]
@@ -48,5 +48,3 @@ while running {
 - `build-from-source` - build the c library with cmake
 - `libp2p-tcp` - expose the low-level libp2p tcp bindings through `speer-sys`
 - `full-chat` - expose everything the chat app needs
-
-if this gets split out, the repo name should be `speer-rust`.
