@@ -547,3 +547,320 @@ pub fn public_key_to_hex(public_key: &PublicKey) -> String {
 pub fn cstr_from_public_key_bytes(bytes: &[u8]) -> Option<&CStr> {
     CStr::from_bytes_until_nul(bytes).ok()
 }
+
+#[cfg(any(feature = "libp2p-identify", feature = "libp2p-kad"))]
+pub mod libp2p {
+    use super::{Error, Result};
+    use std::ffi::CStr;
+
+    #[cfg(feature = "libp2p-identify")]
+    pub mod identify {
+        use super::*;
+
+        #[derive(Debug, Clone, Default)]
+        pub struct IdentifyInfo {
+            pub pubkey_proto: Vec<u8>,
+            pub listen_addrs: Vec<Vec<u8>>,
+            pub protocols: Vec<String>,
+            pub agent_version: String,
+            pub protocol_version: String,
+            pub observed_addr: Option<Vec<u8>>,
+        }
+
+        impl IdentifyInfo {
+            pub fn encode(&self) -> Result<Vec<u8>> {
+                let raw = self.to_raw();
+                let mut out = vec![0u8; 4096];
+                let mut out_len = out.len();
+                super::result_from_code(unsafe {
+                    crate::sys::speer_libp2p_identify_encode(
+                        &raw,
+                        out.as_mut_ptr(),
+                        out.len(),
+                        &mut out_len,
+                    )
+                })?;
+                out.truncate(out_len);
+                Ok(out)
+            }
+
+            pub fn decode(bytes: &[u8]) -> Result<Self> {
+                let mut raw =
+                    unsafe { std::mem::zeroed::<crate::sys::speer_libp2p_identify_info_t>() };
+                super::result_from_code(unsafe {
+                    crate::sys::speer_libp2p_identify_decode(&mut raw, bytes.as_ptr(), bytes.len())
+                })?;
+                Ok(Self::from_raw(&raw))
+            }
+
+            fn to_raw(&self) -> crate::sys::speer_libp2p_identify_info_t {
+                let mut raw =
+                    unsafe { std::mem::zeroed::<crate::sys::speer_libp2p_identify_info_t>() };
+                copy_slice(&self.pubkey_proto, &mut raw.pubkey_proto);
+                raw.pubkey_proto_len = self.pubkey_proto.len().min(raw.pubkey_proto.len());
+                raw.num_listen_addrs = self.listen_addrs.len().min(raw.listen_addrs.len());
+                for (idx, addr) in self
+                    .listen_addrs
+                    .iter()
+                    .take(raw.listen_addrs.len())
+                    .enumerate()
+                {
+                    copy_slice(addr, &mut raw.listen_addrs[idx]);
+                    raw.listen_addr_lens[idx] = addr.len().min(raw.listen_addrs[idx].len());
+                }
+                raw.num_protocols = self.protocols.len().min(raw.protocols.len());
+                for (idx, protocol) in self.protocols.iter().take(raw.protocols.len()).enumerate() {
+                    copy_str(protocol, &mut raw.protocols[idx]);
+                }
+                copy_str(&self.agent_version, &mut raw.agent_version);
+                copy_str(&self.protocol_version, &mut raw.protocol_version);
+                if let Some(observed) = &self.observed_addr {
+                    copy_slice(observed, &mut raw.observed_addr);
+                    raw.observed_addr_len = observed.len().min(raw.observed_addr.len());
+                    raw.has_observed = 1;
+                }
+                raw
+            }
+
+            fn from_raw(raw: &crate::sys::speer_libp2p_identify_info_t) -> Self {
+                let pubkey_proto =
+                    raw.pubkey_proto[..raw.pubkey_proto_len.min(raw.pubkey_proto.len())].to_vec();
+                let mut listen_addrs = Vec::new();
+                for idx in 0..raw.num_listen_addrs.min(raw.listen_addrs.len()) {
+                    listen_addrs.push(
+                        raw.listen_addrs[idx]
+                            [..raw.listen_addr_lens[idx].min(raw.listen_addrs[idx].len())]
+                            .to_vec(),
+                    );
+                }
+                let mut protocols = Vec::new();
+                for idx in 0..raw.num_protocols.min(raw.protocols.len()) {
+                    protocols.push(cstr_array_to_string(&raw.protocols[idx]));
+                }
+                let observed_addr = if raw.has_observed != 0 {
+                    Some(
+                        raw.observed_addr[..raw.observed_addr_len.min(raw.observed_addr.len())]
+                            .to_vec(),
+                    )
+                } else {
+                    None
+                };
+                Self {
+                    pubkey_proto,
+                    listen_addrs,
+                    protocols,
+                    agent_version: cstr_array_to_string(&raw.agent_version),
+                    protocol_version: cstr_array_to_string(&raw.protocol_version),
+                    observed_addr,
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "libp2p-kad")]
+    pub mod kad {
+        use super::*;
+        use std::ptr::NonNull;
+
+        pub const PING: u8 = crate::sys::SPEER_LIBP2P_KAD_PING as u8;
+        pub const FIND_NODE: u8 = crate::sys::SPEER_LIBP2P_KAD_FIND_NODE as u8;
+        pub const GET_VALUE: u8 = crate::sys::SPEER_LIBP2P_KAD_GET_VALUE as u8;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct KadPeer {
+            pub id: [u8; crate::sys::SPEER_LIBP2P_KAD_ID_BYTES as usize],
+            pub address: String,
+        }
+
+        #[derive(Debug, Clone, Default)]
+        pub struct KadMessage {
+            pub msg_type: u8,
+            pub key: Vec<u8>,
+            pub value: Vec<u8>,
+            pub closer_peers: Vec<KadPeer>,
+        }
+
+        impl KadMessage {
+            pub fn encode(&self) -> Result<Vec<u8>> {
+                let raw_peers = self.raw_peers();
+                let raw = crate::sys::speer_libp2p_kad_msg_t {
+                    type_: self.msg_type,
+                    key: optional_ptr(self.key.as_slice()),
+                    key_len: self.key.len(),
+                    value: optional_ptr(self.value.as_slice()),
+                    value_len: self.value.len(),
+                    closer_peers: optional_ptr(raw_peers.as_slice()),
+                    num_closer_peers: raw_peers.len(),
+                };
+                let mut out = vec![0u8; 4096];
+                let mut out_len = out.len();
+                super::result_from_code(unsafe {
+                    crate::sys::speer_libp2p_kad_encode_message(
+                        &raw,
+                        out.as_mut_ptr(),
+                        out.len(),
+                        &mut out_len,
+                    )
+                })?;
+                out.truncate(out_len);
+                Ok(out)
+            }
+
+            pub fn decode(bytes: &[u8]) -> Result<Self> {
+                let mut raw = unsafe { std::mem::zeroed::<crate::sys::speer_libp2p_kad_msg_t>() };
+                let mut raw_peers =
+                    vec![unsafe { std::mem::zeroed::<crate::sys::speer_libp2p_kad_peer_t>() }; 20];
+                super::result_from_code(unsafe {
+                    crate::sys::speer_libp2p_kad_decode_message(
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        &mut raw,
+                        raw_peers.as_mut_ptr(),
+                        raw_peers.len(),
+                    )
+                })?;
+                let closer_peers = raw_peers
+                    .iter()
+                    .take(raw.num_closer_peers.min(raw_peers.len()))
+                    .map(|peer| KadPeer {
+                        id: peer.id,
+                        address: cstr_array_to_string(&peer.address),
+                    })
+                    .collect();
+                Ok(Self {
+                    msg_type: raw.type_,
+                    key: copy_optional(raw.key, raw.key_len),
+                    value: copy_optional(raw.value, raw.value_len),
+                    closer_peers,
+                })
+            }
+
+            fn raw_peers(&self) -> Vec<crate::sys::speer_libp2p_kad_peer_t> {
+                self.closer_peers
+                    .iter()
+                    .map(|peer| {
+                        let mut raw =
+                            unsafe { std::mem::zeroed::<crate::sys::speer_libp2p_kad_peer_t>() };
+                        raw.id = peer.id;
+                        copy_str(&peer.address, &mut raw.address);
+                        raw
+                    })
+                    .collect()
+            }
+        }
+
+        pub struct KadClient {
+            session: NonNull<crate::sys::speer_libp2p_tcp_session_t>,
+        }
+
+        impl KadClient {
+            /// # Safety
+            ///
+            /// `session` must be a valid live libp2p TCP session for the lifetime of the client.
+            pub unsafe fn from_raw(
+                session: *mut crate::sys::speer_libp2p_tcp_session_t,
+            ) -> Result<Self> {
+                Ok(Self {
+                    session: NonNull::new(session).ok_or(Error::Null)?,
+                })
+            }
+
+            pub fn roundtrip(&mut self, request: &[u8]) -> Result<Vec<u8>> {
+                let mut out = vec![0u8; 4096];
+                let mut out_len = out.len();
+                super::result_from_code(unsafe {
+                    crate::sys::speer_libp2p_kad_stream_roundtrip(
+                        self.session.as_ptr(),
+                        request.as_ptr(),
+                        request.len(),
+                        out.as_mut_ptr(),
+                        &mut out_len,
+                    )
+                })?;
+                out.truncate(out_len);
+                Ok(out)
+            }
+        }
+
+        fn optional_ptr<T>(slice: &[T]) -> *const T {
+            if slice.is_empty() {
+                std::ptr::null()
+            } else {
+                slice.as_ptr()
+            }
+        }
+
+        fn copy_optional(ptr: *const u8, len: usize) -> Vec<u8> {
+            if ptr.is_null() || len == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+            }
+        }
+    }
+
+    fn result_from_code(code: i32) -> Result<()> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(Error::Unknown(code))
+        }
+    }
+
+    fn copy_slice(src: &[u8], dst: &mut [u8]) {
+        let len = src.len().min(dst.len());
+        dst[..len].copy_from_slice(&src[..len]);
+    }
+
+    fn copy_str(src: &str, dst: &mut [std::ffi::c_char]) {
+        if dst.is_empty() {
+            return;
+        }
+        let bytes = src.as_bytes();
+        let len = bytes.len().min(dst.len().saturating_sub(1));
+        for (idx, byte) in bytes.iter().take(len).enumerate() {
+            dst[idx] = *byte as std::ffi::c_char;
+        }
+        dst[len] = 0;
+    }
+
+    fn cstr_array_to_string(buf: &[std::ffi::c_char]) -> String {
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[cfg(all(test, feature = "libp2p-kad"))]
+    mod tests {
+        use super::identify::IdentifyInfo;
+        use super::kad::{KadMessage, FIND_NODE};
+
+        #[test]
+        fn identify_roundtrips() {
+            let info = IdentifyInfo {
+                pubkey_proto: b"pubkey".to_vec(),
+                protocols: vec!["/ipfs/kad/1.0.0".to_string()],
+                agent_version: "speer/0.2".to_string(),
+                protocol_version: "ipfs/0.1.0".to_string(),
+                ..IdentifyInfo::default()
+            };
+            let encoded = info.encode().unwrap();
+            let decoded = IdentifyInfo::decode(&encoded).unwrap();
+            assert_eq!(decoded.pubkey_proto, b"pubkey");
+            assert_eq!(decoded.protocols, vec!["/ipfs/kad/1.0.0"]);
+        }
+
+        #[test]
+        fn kad_message_roundtrips() {
+            let msg = KadMessage {
+                msg_type: FIND_NODE,
+                key: vec![7; 32],
+                ..KadMessage::default()
+            };
+            let encoded = msg.encode().unwrap();
+            let decoded = KadMessage::decode(&encoded).unwrap();
+            assert_eq!(decoded.msg_type, FIND_NODE);
+            assert_eq!(decoded.key, vec![7; 32]);
+        }
+    }
+}
