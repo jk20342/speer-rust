@@ -1,37 +1,90 @@
+//! Safe Rust bindings to **libspeer** (`speer.h` in the C workspace).
+//!
+//! # Layers
+//!
+//! - **This crate** ([`Host`], [`Peer`], [`Stream`]) keeps raw pointers alive with PhantomData borrow
+//!   so handles cannot escape their logical owner.
+//! - **[`sys`]** (`speer_sys`) re-exports `bindgen` types and `unsafe` FFI; use only when integrating
+//!   with other C shim code.
+//!
+//! # Reading these docs
+//!
+//! Run `cargo doc -p speer --no-deps --open`. Public types expose concrete lifetimes (`'host`, `'peer`,
+//! `'event`) so rust-analyzer surfaces the borrow graph the same way as normal Rust wrappers.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use speer::{Host, PRIVATE_KEY_SIZE};
+//!
+//! fn main() -> speer::Result<()> {
+//!     let seed = [0u8; PRIVATE_KEY_SIZE];
+//!     let mut host = Host::new(&seed, None)?;
+//!     host.poll(100);
+//!     Ok(())
+//! }
+//! ```
+
 use std::ffi::{c_void, CStr, CString, NulError};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::slice;
 
+/// Raw FFI from [`speer_sys`] (generated `bindings.rs`).
+///
+/// Prefer the safe types in this crate (`Host`, [`Peer`], …). Reach for `sys` when you must call
+/// C helpers not yet wrapped here.
 pub mod sys {
     pub use speer_sys::*;
 }
 
+/// Matches [`crate::sys::SPEER_PUBLIC_KEY_SIZE`].
 pub const PUBLIC_KEY_SIZE: usize = sys::SPEER_PUBLIC_KEY_SIZE as usize;
+/// Matches [`crate::sys::SPEER_PRIVATE_KEY_SIZE`].
 pub const PRIVATE_KEY_SIZE: usize = sys::SPEER_PRIVATE_KEY_SIZE as usize;
+/// Connection id width used in QUIC-style addressing.
 pub const CONNECTION_ID_SIZE: usize = sys::SPEER_CONNECTION_ID_SIZE as usize;
 pub const MAX_PACKET_SIZE: usize = sys::SPEER_MAX_PACKET_SIZE as usize;
 pub const MAX_STREAMS: usize = sys::SPEER_MAX_STREAMS as usize;
 pub const MAX_PEERS: usize = sys::SPEER_MAX_PEERS as usize;
 
+/// Serialized public identity as returned by [`Host::public_key`] / [`Peer::public_key`].
+#[doc(alias = "IdentityPub")]
 pub type PublicKey = [u8; PUBLIC_KEY_SIZE];
+/// Secret seed/key material handed to [`Host::new`] (libspeer derives long-term keys internally).
+#[doc(alias = "SeedKey")]
 pub type PrivateKey = [u8; PRIVATE_KEY_SIZE];
 
+/// [`core::result::Result`] specialization using [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Rust projection of libspeer failures (`SPEER_ERROR_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(alias = "speer_result_t")]
 pub enum Error {
+    /// Wrapped `SPEER_ERROR_INVALID_PARAM`.
     InvalidParam,
+    /// Wrapped `SPEER_ERROR_NO_MEMORY`.
     NoMemory,
+    /// Wrapped `SPEER_ERROR_NETWORK`.
     Network,
+    /// Wrapped `SPEER_ERROR_CRYPTO`.
     Crypto,
+    /// Wrapped `SPEER_ERROR_HANDSHAKE`.
     Handshake,
+    /// Wrapped `SPEER_ERROR_TIMEOUT`.
     Timeout,
+    /// Wrapped `SPEER_ERROR_PEER_NOT_FOUND`.
     PeerNotFound,
+    /// Wrapped `SPEER_ERROR_STREAM_CLOSED`.
     StreamClosed,
+    /// Wrapped `SPEER_ERROR_BUFFER_TOO_SMALL`.
     BufferTooSmall,
+    /// Returned when libspeer exposes a NULL where a handle was promised.
     Null,
+    /// [`CString`] conversion helpers tripped [`NulError`].
     InteriorNul,
+    /// Any numeric code not statically mapped yet.
     Unknown(i32),
 }
 
@@ -87,9 +140,14 @@ fn result_from_code(code: i32) -> Result<()> {
     }
 }
 
+/// Mirrors [`sys::speer_config_t`] with owned [`String`] knobs that survive FFI pinning.
+///
+/// CString copies are rebuilt internally when cloning into [`Host::new`].
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Listening UDP port (`0` lets the OS allocate).
     pub bind_port: u16,
+    /// IPv4 dotted-quad literal or `"0.0.0.0"`.
     pub bind_address: Option<String>,
     pub stun_server: Option<String>,
     pub relay_server: Option<String>,
@@ -152,6 +210,12 @@ fn optional_ptr(value: Option<&CString>) -> *const std::ffi::c_char {
     value.map_or(std::ptr::null(), |s| s.as_ptr())
 }
 
+/// Owns [`sys::speer_host_t`]. Implements [`Drop`] (`speer_host_free`).
+///
+/// Typical loop: [`Host::set_callback`], then [`Host::poll`] until shutdown.
+///
+/// [`Peer`] values borrow this host implicitly via lifetimes (`'host`), and [`PeerRef`]/[`StreamRef`]
+/// mirror callback borrows scoped to `'event`.
 pub struct Host {
     raw: NonNull<sys::speer_host_t>,
     _config_strings: ConfigStrings,
@@ -159,6 +223,7 @@ pub struct Host {
 }
 
 impl Host {
+    /// Allocate a libspeer stack host from `seed_key` (see [`PRIVATE_KEY_SIZE`]).
     pub fn new(seed_key: &PrivateKey, config: Option<Config>) -> Result<Self> {
         let config_strings;
         let raw_config;
@@ -181,14 +246,17 @@ impl Host {
         })
     }
 
+    /// Escape hatch for FFI interop (**`*mut sys::speer_host_t`**).
     pub fn as_raw(&self) -> *mut sys::speer_host_t {
         self.raw.as_ptr()
     }
 
+    /// Thin wrapper around `speer_host_poll`.
     pub fn poll(&mut self, timeout_ms: i32) -> i32 {
         unsafe { sys::speer_host_poll(self.raw.as_ptr(), timeout_ms) }
     }
 
+    /// Installs Rust closure trampoline; boxed until [`Host`] is dropped/cleared.
     pub fn set_callback<F>(&mut self, callback: F)
     where
         F: for<'event> FnMut(Event<'event>) + 'static,
@@ -208,6 +276,7 @@ impl Host {
         }
     }
 
+    /// Removes dispatch + frees boxed callback state **before** `Drop`.
     pub fn clear_callback(&mut self) {
         unsafe {
             sys::speer_host_set_callback(self.raw.as_ptr(), None, std::ptr::null_mut());
@@ -215,14 +284,17 @@ impl Host {
         self.callback = None;
     }
 
+    /// Local static public key libspeer derives from [`Host::new`]'s [`PrivateKey`].
     pub fn public_key(&self) -> Option<PublicKey> {
         copy_key(unsafe { sys::speer_host_get_public_key(self.raw.as_ptr()) })
     }
 
+    /// Bound UDP socket port after libspeer initializes transport.
     pub fn port(&self) -> u16 {
         unsafe { sys::speer_host_get_port(self.raw.as_ptr()) }
     }
 
+    /// Blocking dial helper (`speer_connect`).
     pub fn connect(&self, public_key: &PublicKey, address: Option<&str>) -> Result<Peer<'_>> {
         let address = optional_cstring(address)?;
         let address_ptr = optional_ptr(address.as_ref());
@@ -263,15 +335,27 @@ extern "C" fn callback_trampoline(
     (state.callback)(event);
 }
 
+/// Rust-facing mapping of [`sys::speer_event_type_t`].
+///
+/// Inspect [`Event::event_type`] delivered to [`Host::set_callback`] closures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(alias = "speer_event_type_t")]
 pub enum EventType {
+    /// `SPEER_EVENT_NONE`.
     None,
+    /// Remote peer completed cryptographic handshake (`SPEER_EVENT_PEER_CONNECTED`).
     PeerConnected,
+    /// `SPEER_EVENT_PEER_DISCONNECTED`.
     PeerDisconnected,
+    /// Yamux shim opened multiplex id (`SPEER_EVENT_STREAM_OPENED`).
     StreamOpened,
+    /// Payload surfaced in [`Event::data`] (`SPEER_EVENT_STREAM_DATA`).
     StreamData,
+    /// FIN/reset surfaced for stream (`SPEER_EVENT_STREAM_CLOSED`).
     StreamClosed,
+    /// Generic error bucket (`SPEER_EVENT_ERROR`); probe [`Event::error_code`].
     Error,
+    /// Unknown integer from future libspeer versions.
     Unknown(i64),
 }
 
@@ -292,13 +376,21 @@ impl From<sys::speer_event_type_t> for EventType {
     }
 }
 
+/// Explains why a peer disconnected (`speer_disconnect_reason_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(alias = "speer_disconnect_reason_t")]
 pub enum DisconnectReason {
+    /// `SPEER_DISCONNECT_NORMAL`.
     Normal,
+    /// `SPEER_DISCONNECT_TIMEOUT`.
     Timeout,
+    /// `SPEER_DISCONNECT_HANDSHAKE_FAILED`.
     HandshakeFailed,
+    /// `SPEER_DISCONNECT_PROTOCOL_ERROR`.
     ProtocolError,
+    /// `SPEER_DISCONNECT_APPLICATION`.
     Application,
+    /// Unknown enumerator from forward-compatible builds.
     Unknown(i64),
 }
 
@@ -321,12 +413,17 @@ impl From<sys::speer_disconnect_reason_t> for DisconnectReason {
     }
 }
 
+/// Payload handed to [`Host::set_callback`]. Borrowed slices alias libspeer internals only for the
+/// duration of your closure—copy bytes if needed beyond the dispatch call.
 #[derive(Debug, Clone, Copy)]
 pub struct Event<'event> {
+    /// Mirrors [`sys::speer_event_t::type_`].
     pub event_type: EventType,
+    /// Present for peer-bearing events (`PeerConnected`, `PeerDisconnected`, …).
     pub peer: Option<PeerRef<'event>>,
     pub stream: Option<StreamRef<'event>>,
     pub stream_id: u32,
+    /// Readable range for [`EventType::StreamData`].
     pub data: &'event [u8],
     pub error_code: i32,
     pub disconnect_reason: DisconnectReason,
@@ -352,6 +449,7 @@ impl<'event> Event<'event> {
     }
 }
 
+/// Immutable peer handle surfaced inside callbacks (`'event` tied to trampolined FFI frame).
 #[derive(Debug, Clone, Copy)]
 pub struct PeerRef<'event> {
     raw: NonNull<sys::speer_peer_t>,
@@ -366,19 +464,23 @@ impl<'event> PeerRef<'event> {
         }
     }
 
+    /// Raw `speer_peer_t *`; only valid inside the callback frame `'event`.
     pub fn as_raw(self) -> *mut sys::speer_peer_t {
         self.raw.as_ptr()
     }
 
+    /// Whether the libspeer backend still considers this peer connected.
     pub fn is_connected(self) -> bool {
         unsafe { sys::speer_peer_is_connected(self.raw.as_ptr()) }
     }
 
+    /// Public key backing this peer, if the FFI layer exposes one.
     pub fn public_key(self) -> Option<PublicKey> {
         copy_key(unsafe { sys::speer_peer_get_public_key(self.raw.as_ptr()) })
     }
 }
 
+/// Remote peer acquired via [`Host::connect`]; must not outlive its [`Host`].
 #[derive(Debug)]
 pub struct Peer<'host> {
     raw: NonNull<sys::speer_peer_t>,
@@ -390,12 +492,14 @@ impl<'host> Peer<'host> {
         self.raw.as_ptr()
     }
 
+    /// Closes this side of the peer; further stream operations fail.
     pub fn close(&mut self) {
         unsafe {
             sys::speer_peer_close(self.raw.as_ptr());
         }
     }
 
+    /// Updates the dialing address hint (CString passed to FFI).
     pub fn set_address(&mut self, address: &str) -> Result<()> {
         let address = CString::new(address)?;
         result_from_code(unsafe {
@@ -407,10 +511,12 @@ impl<'host> Peer<'host> {
         unsafe { sys::speer_peer_is_connected(self.raw.as_ptr()) }
     }
 
+    /// Remote public key noise identity, when available from the backend.
     pub fn public_key(&self) -> Option<PublicKey> {
         copy_key(unsafe { sys::speer_peer_get_public_key(self.raw.as_ptr()) })
     }
 
+    /// Opens a multiplexed logical stream (`stream_id` is application-defined).
     pub fn open_stream(&mut self, stream_id: u32) -> Result<Stream<'_, 'host>> {
         let raw = unsafe { sys::speer_stream_open(self.raw.as_ptr(), stream_id) };
         let raw = NonNull::new(raw).ok_or(Error::Null)?;
@@ -421,6 +527,7 @@ impl<'host> Peer<'host> {
     }
 }
 
+/// Stream handle surfaced read-only inside [`Event`].
 #[derive(Debug, Clone, Copy)]
 pub struct StreamRef<'event> {
     raw: NonNull<sys::speer_stream_t>,
@@ -439,6 +546,7 @@ impl<'event> StreamRef<'event> {
         self.raw.as_ptr()
     }
 
+    /// Logical stream identifier chosen when the stream was opened.
     pub fn id(self) -> u32 {
         unsafe { sys::speer_stream_get_id(self.raw.as_ptr()) }
     }
@@ -448,6 +556,7 @@ impl<'event> StreamRef<'event> {
     }
 }
 
+/// Multiplexed stream tied to a [`Peer`] (closes on [`Drop`]).
 #[derive(Debug)]
 pub struct Stream<'peer, 'host> {
     raw: NonNull<sys::speer_stream_t>,
@@ -467,6 +576,7 @@ impl<'peer, 'host> Stream<'peer, 'host> {
         unsafe { sys::speer_stream_is_open(self.raw.as_ptr()) }
     }
 
+    /// Writes plaintext into the multiplexed channel; maps negative FFI codes to [`Error`].
     pub fn write(&mut self, data: &[u8]) -> Result<usize> {
         let written =
             unsafe { sys::speer_stream_write(self.raw.as_ptr(), data.as_ptr(), data.len()) };
@@ -477,6 +587,7 @@ impl<'peer, 'host> Stream<'peer, 'host> {
         }
     }
 
+    /// Blocking-style read filling `buf` from the multiplexed channel.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let read =
             unsafe { sys::speer_stream_read(self.raw.as_ptr(), buf.as_mut_ptr(), buf.len()) };
@@ -496,6 +607,7 @@ impl Drop for Stream<'_, '_> {
     }
 }
 
+/// Deterministic Curve25519 / Noise-friendly keypair helper (`speer_generate_keypair`).
 pub fn generate_keypair(seed: &[u8; 32]) -> Result<(PublicKey, PrivateKey)> {
     let mut public_key = [0u8; PUBLIC_KEY_SIZE];
     let mut private_key = [0u8; PRIVATE_KEY_SIZE];
@@ -509,16 +621,19 @@ pub fn generate_keypair(seed: &[u8; 32]) -> Result<(PublicKey, PrivateKey)> {
     Ok((public_key, private_key))
 }
 
+/// Fills `buf` using `speer_random_bytes`.
 pub fn random_bytes(buf: &mut [u8]) {
     unsafe {
         sys::speer_random_bytes(buf.as_mut_ptr(), buf.len());
     }
 }
 
+/// Same as [`random_bytes`] but returns [`Error`] on RNG failure paths.
 pub fn random_bytes_or_fail(buf: &mut [u8]) -> Result<()> {
     result_from_code(unsafe { sys::speer_random_bytes_or_fail(buf.as_mut_ptr(), buf.len()) })
 }
 
+/// Monotonic-ish millisecond stamp from libspeer utilities.
 pub fn timestamp_ms() -> u64 {
     unsafe { sys::speer_timestamp_ms() }
 }
@@ -535,6 +650,7 @@ fn copy_key(ptr: *const u8) -> Option<PublicKey> {
     }
 }
 
+/// Lowercase hex encoding of [`PUBLIC_KEY_SIZE`] bytes (no prefixes).
 pub fn public_key_to_hex(public_key: &PublicKey) -> String {
     let mut out = String::with_capacity(PUBLIC_KEY_SIZE * 2);
     for byte in public_key {
@@ -544,6 +660,7 @@ pub fn public_key_to_hex(public_key: &PublicKey) -> String {
     out
 }
 
+/// Parses a nul-terminated public key blob (e.g. from config strings).
 pub fn cstr_from_public_key_bytes(bytes: &[u8]) -> Option<&CStr> {
     CStr::from_bytes_until_nul(bytes).ok()
 }

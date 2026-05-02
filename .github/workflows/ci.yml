@@ -44,3 +44,9 @@ jobs:
       - name: clippy
         working-directory: speer
         run: cargo clippy --features full-chat -- -D warnings
+
+      - name: doc (rustdoc)
+        working-directory: speer
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: cargo doc --no-deps --features full-chat

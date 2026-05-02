@@ -14,11 +14,23 @@ to the peer lifetime. the unsafe calls stay inside the crate.
 cargo check
 ```
 
+## documentation
+
+Rustdoc for **this crate only**, from **this repository’s root**:
+
+```bash
+cargo doc --no-deps --open
+```
+
+Output: `./target/doc/speer/` (open `index.html` if you omit `--open`).
+
+Published docs: [`docs.rs/speer`](https://docs.rs/speer/latest/speer/).
+
 ## use
 
 ```toml
 [dependencies]
-speer = "0.1"
+speer = "0.2"
 ```
 
 or from a local checkout:

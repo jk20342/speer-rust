@@ -1,12 +1,16 @@
 [package]
 name = "speer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/jk20342/speer-rust"
 homepage = "https://github.com/jk20342/speer-rust"
 description = "safe rust wrapper for speer"
+documentation = "https://docs.rs/speer"
 exclude = [".github/**"]
+
+[package.metadata.docs.rs]
+features = ["full-chat"]
 
 [features]
 default = ["build-from-source"]
@@ -18,4 +22,4 @@ libp2p-tcp = ["speer-sys/libp2p-tcp"]
 static = ["speer-sys/static"]
 
 [dependencies]
-speer-sys = { version = "0.2.0", path = "../speer-sys", default-features = false }
+speer-sys = { version = "0.2.1", path = "../speer-sys", default-features = false }
