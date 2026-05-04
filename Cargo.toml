@@ -22,4 +22,4 @@ libp2p-tcp = ["speer-sys/libp2p-tcp"]
 static = ["speer-sys/static"]
 
 [dependencies]
-speer-sys = { version = "0.2.2", path = "../speer-sys-rust", default-features = false }
+speer-sys = { version = "0.2.2", default-features = false }
